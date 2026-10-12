@@ -1,4 +1,4 @@
-"""Dados esperados e retornados pela API de cadastro."""
+"""Esquemas das mensagens HTTP da loja."""
 
 from pydantic import BaseModel, EmailStr, Field, field_validator
 
@@ -6,7 +6,7 @@ from pydantic import BaseModel, EmailStr, Field, field_validator
 class RegistrationIn(BaseModel):
     name: str = Field(min_length=1, max_length=100)
     email: EmailStr
-    password: str = Field(min_length=6, max_length=128)
+    password: str = Field(min_length=12, max_length=128)
 
     @field_validator("name")
     @classmethod
@@ -23,3 +23,30 @@ class RegistrationOut(BaseModel):
     email: str
     totp_secret: str
     otpauth_uri: str
+
+
+class PasswordLoginIn(BaseModel):
+    email: EmailStr
+    password: str
+
+
+class PasswordLoginOut(BaseModel):
+    challenge: str
+    expires_in: int
+
+
+class TotpLoginIn(BaseModel):
+    challenge: str
+    code: str = Field(pattern=r"^[0-9]{6}$")
+
+
+class TotpLoginOut(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    expires_in: int
+
+
+class UserOut(BaseModel):
+    user_id: int
+    name: str
+    email: str

@@ -6,3 +6,5 @@ cryptography>=42
 qrcode>=7.4
 email-validator>=2.0
 pytest>=8.0
+
+IP2Location>=8.0,<10.0
