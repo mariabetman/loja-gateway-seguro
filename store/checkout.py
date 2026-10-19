@@ -3,8 +3,11 @@
 import json
 import secrets
 import time
+from contextlib import contextmanager
+from threading import Lock
 
 import httpx
+from cryptography.exceptions import InvalidTag
 
 from shared.crypto import open_seal, seal
 from shared.geo import lookup_ip
@@ -12,10 +15,25 @@ from store import database
 from store.auth import session_proof
 
 GATEWAY_URL = "http://127.0.0.1:8001"
+_cart_locks = {}
+_locks_guard = Lock()
 
 
 class CartError(ValueError):
     pass
+
+
+@contextmanager
+def _lock_cart(user_id):
+    # A loja atual executa em um único processo, com requisições em threads.
+    with _locks_guard:
+        lock = _cart_locks.setdefault(user_id, Lock())
+    if not lock.acquire(blocking=False):
+        raise CartError("Carrinho em processamento. Aguarde e tente novamente.")
+    try:
+        yield
+    finally:
+        lock.release()
 
 
 def products() -> list[dict]:
@@ -37,6 +55,11 @@ def cart(user_id: int) -> dict:
 
 
 def set_quantity(user_id: int, product_id: str, quantity: int) -> dict:
+    with _lock_cart(user_id):
+        return _set_quantity(user_id, product_id, quantity)
+
+
+def _set_quantity(user_id: int, product_id: str, quantity: int) -> dict:
     if type(quantity) is not int or not 0 <= quantity <= 100:
         raise CartError("Quantidade deve estar entre 0 e 100.")
     with database.connect() as conn:
@@ -56,6 +79,11 @@ def set_quantity(user_id: int, product_id: str, quantity: int) -> dict:
 
 
 def checkout(user_id: int, token: str, client_ip: str, payment_passphrase: str) -> dict:
+    with _lock_cart(user_id):
+        return _checkout(user_id, token, client_ip, payment_passphrase)
+
+
+def _checkout(user_id: int, token: str, client_ip: str, payment_passphrase: str) -> dict:
     items_info = cart(user_id)
     if not items_info["items"]:
         raise CartError("O carrinho está vazio.")
@@ -100,7 +128,7 @@ def checkout(user_id: int, token: str, client_ip: str, payment_passphrase: str) 
             raise CartError("Resposta do gateway não corresponde ao pedido.")
         if result.get("status") not in {"APPROVED", "BLOCKED"}:
             raise CartError("Status inesperado do gateway.")
-    except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
+    except (httpx.HTTPError, ValueError, KeyError, TypeError, InvalidTag):
         result = {"status": "ERROR", "reason": "GATEWAY_UNAVAILABLE_OR_INVALID_RESPONSE"}
 
     with database.connect() as conn:

@@ -3,7 +3,11 @@
 import base64
 import json
 import time
+from contextlib import nullcontext
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier, Event
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -97,6 +101,29 @@ def test_full_purchase_and_location(servers):
         assert conn.execute("SELECT COUNT(*) FROM transactions WHERE status='APPROVED'").fetchone()[0] == 1
 
 
+def test_attack_demo_completes_all_four_scenarios(servers, monkeypatch, capsys):
+    from client import api
+    from scripts import demo_attacks
+
+    store, gateway = servers
+    registered = store.post("/register", json=USER).json()
+
+    def answer(prompt):
+        if "E-mail" in prompt:
+            return USER["email"]
+        return generate_totp(registered["totp_secret"], int(time.time()) // 30)
+
+    phrases = iter([USER["password"], SHARED])
+    monkeypatch.setattr("builtins.input", answer)
+    monkeypatch.setattr(demo_attacks, "getpass", lambda prompt: next(phrases))
+    monkeypatch.setattr(api, "http_client", lambda: nullcontext(store))
+    monkeypatch.setattr(demo_attacks.httpx, "Client", lambda **kwargs: nullcontext(gateway))
+    demo_attacks.main()
+    output = capsys.readouterr().out
+    assert "4/4 demonstrações aprovadas" in output
+    assert "FALHOU" not in output
+
+
 def test_replay_and_aead_tampering(servers):
     store, gateway = servers
     headers = logged(servers)
@@ -115,6 +142,133 @@ def test_replay_and_aead_tampering(servers):
     damaged["ciphertext"] = base64.b64encode(ciphertext).decode()
     bad = gateway.post("/pay", json=damaged).json()
     assert bad["reason"] == "INVALID_AUTHENTICATION"
+
+
+def test_tampered_gateway_response_marks_order_error(servers, monkeypatch):
+    store, gateway = servers
+    headers = logged(servers)
+    store.put("/cart", json={"product_id": "P01", "quantity": 2}, headers=headers)
+
+    def tampered_response(envelope):
+        response = gateway.post("/pay", json=envelope).json()
+        ciphertext = bytearray(base64.b64decode(response["ciphertext"]))
+        ciphertext[-1] ^= 1
+        response["ciphertext"] = base64.b64encode(ciphertext).decode()
+        return response
+
+    monkeypatch.setattr(shopping, "send_payment", tampered_response)
+    response = store.post("/checkout", json={}, headers=headers)
+    assert response.status_code == 200
+    order = response.json()
+    assert order["status"] == "ERROR"
+    assert order["reason"] == "GATEWAY_UNAVAILABLE_OR_INVALID_RESPONSE"
+    assert store.get("/orders", headers=headers).json()[0]["status"] == "ERROR"
+    assert store.get("/cart", headers=headers).json()["total_cents"] == 10000
+    with gdb.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == 1
+
+
+@pytest.mark.parametrize("outcome", ["APPROVED", "BLOCKED", "ERROR"])
+def test_cart_is_locked_during_payment_and_released_afterwards(servers, monkeypatch, outcome):
+    store, _ = servers
+    headers = logged(servers)
+    other = store.post("/register", json={**USER, "email": "outro@example.com"}).json()
+    store.put("/cart", json={"product_id": "P01", "quantity": 2}, headers=headers)
+    started, release = Event(), Event()
+    send = shopping.send_payment
+
+    def delayed_payment(envelope):
+        started.set()
+        assert release.wait(timeout=10)
+        if outcome == "ERROR":
+            raise httpx.ConnectError("Gateway indisponível no teste")
+        if outcome == "BLOCKED":
+            message = open_seal(envelope, SHARED, "payment-request-v1")
+            return seal({"order_id": message["order_id"], "nonce": message["nonce"],
+                         "status": "BLOCKED", "reason": "TEST_BLOCKED"}, SHARED, "payment-response-v1")
+        return send(envelope)
+
+    monkeypatch.setattr(shopping, "send_payment", delayed_payment)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        pending = executor.submit(store.post, "/checkout", json={}, headers=headers)
+        try:
+            assert started.wait(timeout=10)
+            # Nem produto novo, nem remoção, nem mudança de quantidade durante o pagamento.
+            for product, quantity in [("P02", 1), ("P01", 0), ("P01", 3)]:
+                change = store.put("/cart", json={"product_id": product, "quantity": quantity}, headers=headers)
+                assert change.status_code == 400
+                assert "Carrinho em processamento" in change.json()["detail"]
+            duplicate = store.post("/checkout", json={}, headers=headers)
+            assert duplicate.status_code == 400
+            assert "Carrinho em processamento" in duplicate.json()["detail"]
+            # O bloqueio pertence ao usuário; outro carrinho continua disponível.
+            assert shopping.set_quantity(other["user_id"], "P02", 1)["total_cents"] == 3500
+        finally:
+            release.set()
+        response = pending.result(timeout=10)
+
+    assert response.status_code == 200
+    assert response.json()["status"] == outcome
+    expected = 0 if outcome == "APPROVED" else 10000
+    assert store.get("/cart", headers=headers).json()["total_cents"] == expected
+    assert len(store.get("/orders", headers=headers).json()) == 1
+    assert store.put("/cart", json={"product_id": "P02", "quantity": 1}, headers=headers).status_code == 200
+
+
+@pytest.mark.parametrize("processed", [False, True])
+def test_lost_response_marks_error_without_resending_payment(servers, monkeypatch, processed):
+    store, _ = servers
+    headers = logged(servers)
+    store.put("/cart", json={"product_id": "P01", "quantity": 2}, headers=headers)
+    send = shopping.send_payment
+    calls = []
+
+    def lost_response(envelope):
+        calls.append(envelope)
+        if processed:
+            send(envelope)
+        raise httpx.ReadTimeout("Resultado não confirmado no teste")
+
+    monkeypatch.setattr(shopping, "send_payment", lost_response)
+    response = store.post("/checkout", json={}, headers=headers)
+    assert response.status_code == 200
+    order = response.json()
+    assert order["status"] == "ERROR"
+    assert order["reason"] == "GATEWAY_UNAVAILABLE_OR_INVALID_RESPONSE"
+    assert store.get("/orders", headers=headers).json()[0]["status"] == "ERROR"
+    assert store.get("/orders/" + order["order_id"], headers=headers).json()["status"] == "ERROR"
+    assert store.get("/cart", headers=headers).json()["total_cents"] == 10000
+    assert len(calls) == 1
+    with gdb.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == int(processed)
+
+
+def test_amount_tampering_targets_value_and_fails_authentication(servers):
+    from scripts.demo_attacks import tamper_amount
+    _, gateway = servers
+    message = auth_message()
+    envelope = seal(message, SHARED, "payment-request-v1")
+    order = {"order_id": message["order_id"], "user_id": message["user_id"],
+             "items": message["items"], "total_cents": message["amount_cents"]}
+    damaged = tamper_amount(envelope, order)
+
+    # Confere a mudança pretendida usando o texto original conhecido no teste.
+    plaintext = json.dumps(message, ensure_ascii=False, separators=(",", ":")).encode()
+    original = base64.b64decode(envelope["ciphertext"])
+    altered = base64.b64decode(damaged["ciphertext"])
+    intended = json.loads(bytes(p ^ a ^ b for p, a, b in zip(plaintext, original, altered)))
+    assert intended == {**message, "amount": 1000}
+    assert damaged["salt"] == envelope["salt"]
+    assert altered[-16:] == original[-16:]  # A tag não foi recalculada.
+
+    result = gateway.post("/pay", json=damaged).json()
+    assert result["status"] == "BLOCKED"
+    assert result["reason"] == "INVALID_AUTHENTICATION"
+    with gdb.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == 0
+    # O original continua válido: a rejeição anterior não foi causada por replay.
+    response = gateway.post("/pay", json=envelope).json()
+    assert open_seal(response, SHARED, "payment-response-v1")["status"] == "APPROVED"
 
 
 def test_location_spoofed_by_client_is_ignored(servers):
@@ -147,6 +301,39 @@ def test_gateway_business_rejections(servers, change, expected):
     _, gateway = servers
     result, _ = gateway_pay(gateway, auth_message(**change))
     assert result["status"] == "BLOCKED" and result["reason"] == expected
+
+
+def test_same_order_with_new_nonce_is_blocked_after_restart(servers):
+    _, gateway = servers
+    first, _ = gateway_pay(gateway, auth_message())
+    assert first["status"] == "APPROVED"
+    gdb.init_db()
+    second, _ = gateway_pay(gateway, auth_message())
+    assert second["status"] == "BLOCKED"
+    assert second["reason"] == "DUPLICATE_ORDER"
+    with gdb.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM transactions WHERE status='APPROVED'").fetchone()[0] == 1
+
+
+def test_simultaneous_payments_for_same_order_have_one_approval(servers, monkeypatch):
+    from gateway import validation
+    barrier = Barrier(2)
+    lookup = validation.lookup_ip
+
+    def synchronized_lookup(ip):
+        location = lookup(ip)
+        barrier.wait(timeout=10)
+        return location
+
+    monkeypatch.setattr(validation, "lookup_ip", synchronized_lookup)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        pending = [executor.submit(validate_and_process, auth_message()) for _ in range(2)]
+        results = [future.result(timeout=15) for future in pending]
+    assert sorted(result["status"] for result in results) == ["APPROVED", "BLOCKED"]
+    blocked = next(result for result in results if result["status"] == "BLOCKED")
+    assert blocked["reason"] == "DUPLICATE_ORDER"
+    with gdb.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM transactions WHERE status='APPROVED'").fetchone()[0] == 1
 
 
 def test_gateway_checks_authenticated_totp(servers):
@@ -218,6 +405,8 @@ def test_real_ip2location_adapter_with_sdk_stub(monkeypatch, tmp_path):
             assert ip == "8.8.8.8"
             return SimpleNamespace(country_short="US", region="California", city="Mountain View",
                                    latitude=37.4, longitude=-122.1, asn="15169", as_name="Google")
+        def close(self):
+            pass
     monkeypatch.setitem(sys.modules, "IP2Location", SimpleNamespace(IP2Location=MockReader))
     location = geo.lookup_ip("8.8.8.8")
     assert location["source"] == "IP2LOCATION"
@@ -240,3 +429,45 @@ def test_old_timestamp_valid_nonce_is_blocked(servers):
     _, gateway = servers
     r, _ = gateway_pay(gateway, auth_message(timestamp=int(time.time()) - 999))
     assert r["reason"] == "INVALID_TIMESTAMP"
+
+
+def test_tunnel_purchase_uses_public_ip2location_context(servers, monkeypatch, tmp_path):
+    import sys
+    from types import SimpleNamespace
+    from shared import geo
+    store, _ = servers
+    fake_bin = tmp_path / "geo.BIN"
+    fake_bin.write_bytes(b"sdk-stub")
+    monkeypatch.setattr(geo, "DB_FILE", fake_bin)
+    calls, closed = [], []
+
+    class Reader:
+        def __init__(self, path):
+            assert path == str(fake_bin)
+        def get_all(self, ip):
+            calls.append(ip)
+            return SimpleNamespace(country_short="BR", region="Santa Catarina", city="Florianopolis",
+                                   latitude="-27.596270", longitude="-48.549171",
+                                   asn="This parameter is unavailable in selected .BIN data file.",
+                                   as_name="This parameter is unavailable in selected .BIN data file.", isp="-")
+        def close(self):
+            closed.append(True)
+
+    monkeypatch.setitem(sys.modules, "IP2Location", SimpleNamespace(IP2Location=Reader))
+    monkeypatch.setattr(store_app.state, "tunnel_host", "test-origin.internal", raising=False)
+    store.headers.update({"Host": "test-origin.internal", "CF-Connecting-IP": "150.162.60.21",
+                          "X-Forwarded-Proto": "https", "X-Forwarded-For": "8.8.8.8"})
+    headers = logged(servers)
+    location = store.get("/me/location", headers=headers).json()
+    assert location["source"] == "IP2LOCATION"
+    assert location["ip"] == "150.162.60.21"
+    assert location["latitude"] == -27.596270 and location["longitude"] == -48.549171
+    assert location["asn"] is None and location["organization"] is None
+    store.put("/cart", json={"product_id": "P01", "quantity": 2}, headers=headers)
+    order = store.post("/checkout", json={"location": {"country": "US"}}, headers=headers).json()
+    assert order["status"] == "APPROVED"
+    assert order["location"] == location
+    assert len(calls) >= 5 and set(calls) == {"150.162.60.21"}
+    assert len(closed) == len(calls)
+    # Nem um acesso local direto pode fornecer um IP arbitrário sem a identificação do túnel.
+    assert store.get("/me/location", headers={**headers, "Host": "127.0.0.1:8000"}).status_code == 403

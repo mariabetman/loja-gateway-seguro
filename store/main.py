@@ -13,8 +13,19 @@ from store.models import (PasswordLoginIn, PasswordLoginOut, RegistrationIn, Reg
                           TotpLoginIn, TotpLoginOut, UserOut)
 from store.security import init_or_verify_master_passphrase
 from shared.geo import GeoError, lookup_ip
+from store.network import observed_ip
+from starlette.responses import JSONResponse
 
 app = FastAPI(title="Loja Virtual Segura")
+
+
+@app.middleware("http")
+async def verify_connection(request: Request, call_next):
+    try:
+        request.state.observed_ip = observed_ip(request)
+    except HTTPException as exc:
+        return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
+    return await call_next(request)
 
 
 class CartUpdate(BaseModel):
@@ -29,7 +40,7 @@ class CheckoutIn(BaseModel):
 
 
 def _ip(request: Request) -> str:
-    return request.client.host if request.client else "unknown"
+    return request.state.observed_ip
 
 
 def _secret(request: Request, key: str) -> str:

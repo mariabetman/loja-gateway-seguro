@@ -58,6 +58,8 @@ def print_cart(cart):
 
 def print_order(order):
     print(f"Pedido: {order['order_id']} | {order['status']} | {money(order['total_cents'])}")
+    if order["status"] == "ERROR":
+        print("Resultado do pagamento não confirmado. Confira antes de fazer outra compra.")
     if order.get("reason"):
         print("Motivo:", order["reason"])
     print("Localização aproximada registrada:", order["location"])

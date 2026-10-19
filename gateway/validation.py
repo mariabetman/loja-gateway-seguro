@@ -95,6 +95,13 @@ def validate_and_process(message: dict) -> dict:
         status, reason = "BLOCKED", "INVALID_ORDER"
 
     with database.connect() as conn:
+        # Serializa a consulta e o registro para impedir aprovações simultâneas do mesmo pedido.
+        conn.execute("BEGIN IMMEDIATE")
+        previous = conn.execute(
+            "SELECT 1 FROM transactions WHERE order_id=? LIMIT 1", (str(order_id),)
+        ).fetchone()
+        if previous:
+            status, reason = "BLOCKED", "DUPLICATE_ORDER"
         conn.execute(
             "INSERT INTO transactions(order_id,nonce,amount_cents,status,reason,created_at) "
             "VALUES (?,?,?,?,?,?)",

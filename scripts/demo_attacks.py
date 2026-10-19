@@ -23,6 +23,22 @@ def report(name, actual, expected):
     return passed
 
 
+def tamper_amount(envelope, order):
+    """Usa dados/formato conhecidos para tentar mudar 100.0 para 1000, sem chave."""
+    if order["total_cents"] != 10000:
+        raise ValueError("A demonstração de alteração de valor exige um pedido de R$ 100,00.")
+    prefix = {"order_id": order["order_id"], "user_id": order["user_id"],
+              "items": order["items"], "amount_cents": order["total_cents"]}
+    offset = len(json.dumps(prefix, ensure_ascii=False, separators=(",", ":")).encode()[:-1]
+                 + b',"amount":')
+    ciphertext = bytearray(base64.b64decode(envelope["ciphertext"]))
+    # Os cinco bytes mantêm o tamanho do JSON: o espaço após 1000 é válido.
+    # GCM usa CTR: aplicar a diferença XOR tenta trocar os bytes conhecidos.
+    for index, (before, after) in enumerate(zip(b"100.0", b"1000 ")):
+        ciphertext[offset + index] ^= before ^ after
+    return {**envelope, "ciphertext": base64.b64encode(ciphertext).decode()}
+
+
 def main():
     print("=== Demonstração de ataques (somente em ambiente de teste) ===")
     email = input("E-mail cadastrado: ").strip()
@@ -34,15 +50,19 @@ def main():
     code = input("Código TOTP CORRETO do aplicativo (6 dígitos): ").strip()
     first = api.login_password(email, password)
     bad_code = "000000" if code != "000000" else "999999"
-    with httpx.Client(base_url=api.STORE_URL) as http:
+    with api.http_client() as http:
         wrong = http.post("/login/totp", json={"challenge": first["challenge"], "code": bad_code})
     passed.append(report("C: TOTP inválido", wrong.status_code, 401))
 
     token = api.login_totp(first["challenge"], code)["access_token"]
+    location = api.get_location(token)
+    # Garante um pedido de exatamente R$ 100,00 para a demonstração.
+    for item in api.cart(token)["items"]:
+        api.set_quantity(token, item["product_id"], 0)
     api.set_quantity(token, "P01", 2)
 
     # D. Cliente tenta falsificar localização, valor e itens. O servidor ignora.
-    with httpx.Client(base_url=api.STORE_URL) as http:
+    with api.http_client() as http:
         response = http.post("/checkout", json={
             "location": {"country": "US", "region": "CA", "city": "Fake City"},
             "amount": 999999, "items": [{"product_id": "P01", "unit_price": 1}],
@@ -51,8 +71,10 @@ def main():
     order = response.json()
     print("Compra válida:", order["order_id"], order["status"])
     print("Localização observada pela loja:", order["location"])
+    if order["status"] != "APPROVED":
+        raise ValueError("A compra de referência não foi aprovada; confira loja e gateway.")
     passed.append(report("D: localização falsa ignorada",
-                         order["location"].get("country") != "US" and order["total_cents"] == 10000, True))
+                         order["location"] == location and order["total_cents"] == 10000, True))
 
     with database.connect() as conn:
         recorded = conn.execute(
@@ -67,18 +89,18 @@ def main():
         replay_result = open_seal(replay.json(), payment_passphrase, "payment-response-v1")
         passed.append(report("A: replay", replay_result.get("reason"), "INVALID_NONCE"))
 
-        # B. Adultera um byte do ciphertext sem conhecer/recriar a tag AES-GCM.
-        damaged = dict(envelope)
-        raw = bytearray(base64.b64decode(damaged["ciphertext"]))
-        raw[0] ^= 1
-        damaged["ciphertext"] = base64.b64encode(raw).decode()
+        # B. Tenta trocar o amount de 100.0 para 1000, mantendo a tag original.
+        damaged = tamper_amount(envelope, order)
+        print("B: tentativa de alterar amount de R$ 100,00 para R$ 1.000,00")
         tamper = http.post(GATEWAY, json=damaged)
         tamper.raise_for_status()
-        passed.append(report("B: alteração de mensagem cifrada",
+        passed.append(report("B: alteração do valor",
                              tamper.json().get("reason"), "INVALID_AUTHENTICATION"))
 
     api.logout(token)
     print(f"\nResultado: {sum(passed)}/{len(passed)} demonstrações aprovadas")
+    if not all(passed):
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
